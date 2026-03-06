@@ -96,7 +96,8 @@ def _calculate_price_with_vat(price: float | None) -> float:
         base_price = float(price)
     
     # Add 21% VAT and round to 2 decimal places
-    return round(base_price * 1.21, 2)
+    # Add tiny epsilon to handle banker's rounding edge cases (e.g., 0.5 rounds up)
+    return round((base_price * 1.21) + 0.000001, 2)
 
 
 def _extract_color(attributes: dict | None) -> str:
