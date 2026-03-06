@@ -2,6 +2,7 @@
 Business logic for ERP data transformation.
 """
 import json
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from django.conf import settings
 
@@ -89,15 +90,21 @@ def _calculate_price_with_vat(price: float | None) -> float:
     """
     Calculate price including 21% VAT.
     Null or negative prices are treated as 0.0.
+    Uses Decimal for precise financial calculations.
     """
     if price is None or not isinstance(price, (int, float)) or price < 0:
-        base_price = 0.0
-    else:
-        base_price = float(price)
+        return 0.0
     
-    # Add 21% VAT and round to 2 decimal places
-    # Add tiny epsilon to handle banker's rounding edge cases (e.g., 0.5 rounds up)
-    return round((base_price * 1.21) + 0.000001, 2)
+    # Use Decimal for precise financial calculations
+    base_price = Decimal(str(price))
+    vat_rate = Decimal('1.21')
+    
+    # Calculate price with VAT and round to 2 decimal places using ROUND_HALF_UP
+    price_with_vat = (base_price * vat_rate).quantize(
+        Decimal('0.01'), rounding=ROUND_HALF_UP
+    )
+    
+    return float(price_with_vat)
 
 
 def _extract_color(attributes: dict | None) -> str:

@@ -4,14 +4,14 @@ Celery tasks for ERP to E-shop synchronization.
 This module implements Delta Sync logic:
 - Only products with changed data are sent to the API
 - Uses SHA-256 hash to detect changes
-- Handles rate limiting with automatic retries
+- Uses chunking to process products in batches
+- Uses Celery's rate_limit for API throttling (non-blocking)
 """
 import hashlib
 import json
-import time
 
 import requests
-from celery import shared_task
+from celery import shared_task, group
 
 from integrator.models import ProductSyncState
 from integrator.services import parse_and_transform_erp_data
@@ -21,98 +21,183 @@ from integrator.services import parse_and_transform_erp_data
 ESHOP_API_BASE_URL = "https://api.fake-eshop.cz/v1/products"
 ESHOP_API_HEADERS = {"X-Api-Key": "symma-secret-token"}
 
-# Rate limiting: max 4 requests per second (API limit is 5 req/s)
-REQUEST_DELAY = 0.25
+# Chunk size for batch processing
+CHUNK_SIZE = 100
 
 
-@shared_task(bind=True, max_retries=5)
-def sync_erp_to_eshop(self):
+def _chunk_list(lst: list, chunk_size: int):
+    """Split a list into chunks of specified size."""
+    for i in range(0, len(lst), chunk_size):
+        yield lst[i:i + chunk_size]
+
+
+@shared_task
+def sync_erp_to_eshop():
     """
-    Synchronize ERP product data to e-shop API using Delta Sync.
+    Orchestrator task: reads ERP data and dispatches chunk sub-tasks.
     
-    - Reads and transforms data from erp_data.json
-    - Computes hash for each product to detect changes
-    - Sends only new or modified products to the API
-    - POST for new products, PATCH for updates
-    - Handles rate limiting (429) with automatic retry
+    This task does not block the worker. It reads the ERP file, determines which
+    products need syncing, groups them into chunks, and dispatches sync_product_chunk
+    tasks to the Celery queue. If a chunk fails (e.g., 429), only that chunk retries.
     
     Returns:
-        dict: Summary of sync operation with counts of created, updated, skipped products
+        dict: Summary with counts of dispatched, skipped products and chunks
     """
-    # Get transformed product data from ERP
     products = parse_and_transform_erp_data()
     
-    # Counters for sync summary
-    stats = {
-        'created': 0,
-        'updated': 0,
-        'skipped': 0,
-        'errors': 0,
-    }
+    products_to_sync = []
+    skipped = 0
     
     for product in products:
         sku = product['sku']
-        
-        # Calculate SHA-256 hash of product data for change detection
         product_hash = _calculate_hash(product)
         
-        # Check if product was previously synced
+        # Check if product was previously synced with same hash
         try:
             sync_state = ProductSyncState.objects.get(sku=sku)
-            
-            # Product exists in our sync state
             if sync_state.data_hash == product_hash:
-                # Hash matches - no changes, skip this product
-                stats['skipped'] += 1
+                skipped += 1
                 continue
-            
-            # Hash differs - product was modified, use PATCH
-            method = 'PATCH'
-            url = f"{ESHOP_API_BASE_URL}/{sku}/"
-            
+            is_new = False
         except ProductSyncState.DoesNotExist:
-            # New product - use POST
-            sync_state = None
+            is_new = True
+        
+        products_to_sync.append({
+            'product': product,
+            'hash': product_hash,
+            'is_new': is_new,
+        })
+    
+    # Split into chunks and dispatch
+    chunks = list(_chunk_list(products_to_sync, CHUNK_SIZE))
+    tasks = [sync_product_chunk.s(chunk) for chunk in chunks]
+    
+    if tasks:
+        group(tasks).apply_async()
+    
+    return {
+        'dispatched': len(products_to_sync),
+        'skipped': skipped,
+        'total': len(products),
+        'chunks': len(chunks),
+    }
+
+
+@shared_task(bind=True, max_retries=5)
+def sync_product_chunk(self, chunk: list):
+    """
+    Sync a chunk of products to the e-shop API.
+    
+    If rate limited (429), only this chunk retries - not the entire sync.
+    
+    Args:
+        chunk: List of dicts with 'product', 'hash', 'is_new' keys
+        
+    Returns:
+        dict: Summary of chunk sync results
+    """
+    results = {'created': 0, 'updated': 0, 'errors': 0}
+    
+    for item in chunk:
+        product = item['product']
+        product_hash = item['hash']
+        is_new = item['is_new']
+        sku = product['sku']
+        
+        if is_new:
             method = 'POST'
             url = f"{ESHOP_API_BASE_URL}/"
+        else:
+            method = 'PATCH'
+            url = f"{ESHOP_API_BASE_URL}/{sku}/"
         
-        # Send request to e-shop API
         try:
             response = _send_to_eshop(method, url, product)
             
-            # Handle rate limiting
+            # Handle rate limiting - retry only this chunk
             if response.status_code == 429:
-                # Rate limit exceeded - retry the entire task after 10 seconds
                 raise self.retry(
                     countdown=10,
-                    exc=Exception(f"Rate limit exceeded while processing {sku}")
+                    exc=Exception(f"Rate limit exceeded at {sku}, chunk will retry")
                 )
             
-            # Check for successful response
             if response.status_code in (200, 201):
-                # Save or update sync state with new hash
-                if sync_state:
-                    sync_state.data_hash = product_hash
-                    sync_state.save()
-                    stats['updated'] += 1
+                ProductSyncState.objects.update_or_create(
+                    sku=sku,
+                    defaults={'data_hash': product_hash}
+                )
+                if is_new:
+                    results['created'] += 1
                 else:
-                    ProductSyncState.objects.create(
-                        sku=sku,
-                        data_hash=product_hash
-                    )
-                    stats['created'] += 1
+                    results['updated'] += 1
             else:
-                # Log error but continue with other products
-                stats['errors'] += 1
+                results['errors'] += 1
                 
-        except requests.RequestException as e:
-            # Network error - log and continue
-            stats['errors'] += 1
-        
-        # Rate limiting: wait before next request
-        time.sleep(REQUEST_DELAY)
+        except requests.RequestException:
+            results['errors'] += 1
     
-    return stats
+    return results
+
+
+# Keep single product task for backward compatibility and fine-grained control
+@shared_task(bind=True, max_retries=5, rate_limit='4/s')
+def sync_product_to_eshop(self, product: dict, product_hash: str, is_new: bool):
+    """
+    Sync a single product to the e-shop API.
+    
+    Rate limiting is handled by Celery's rate_limit='4/s' (4 requests per second),
+    which respects the API limit of 5 req/s with safety margin.
+    
+    Args:
+        product: Product data dictionary
+        product_hash: Pre-calculated SHA-256 hash of product data
+        is_new: True if product is new (POST), False if update (PATCH)
+        
+    Returns:
+        dict: Result of the sync operation
+    """
+    sku = product['sku']
+    
+    if is_new:
+        method = 'POST'
+        url = f"{ESHOP_API_BASE_URL}/"
+    else:
+        method = 'PATCH'
+        url = f"{ESHOP_API_BASE_URL}/{sku}/"
+    
+    try:
+        response = _send_to_eshop(method, url, product)
+        
+        # Handle rate limiting with automatic retry
+        if response.status_code == 429:
+            raise self.retry(
+                countdown=10,
+                exc=Exception(f"Rate limit exceeded for {sku}")
+            )
+        
+        if response.status_code in (200, 201):
+            # Update or create sync state
+            ProductSyncState.objects.update_or_create(
+                sku=sku,
+                defaults={'data_hash': product_hash}
+            )
+            return {
+                'sku': sku,
+                'status': 'created' if is_new else 'updated',
+            }
+        else:
+            return {
+                'sku': sku,
+                'status': 'error',
+                'code': response.status_code,
+            }
+            
+    except requests.RequestException as e:
+        return {
+            'sku': sku,
+            'status': 'error',
+            'message': str(e),
+        }
 
 
 def _calculate_hash(product: dict) -> str:

@@ -19,7 +19,14 @@ from integrator.services import (
     _calculate_stock_total,
     _extract_color,
 )
-from integrator.tasks import sync_erp_to_eshop, ESHOP_API_BASE_URL
+from integrator.tasks import (
+    sync_erp_to_eshop,
+    sync_product_to_eshop,
+    sync_product_chunk,
+    ESHOP_API_BASE_URL,
+    _calculate_hash,
+    CHUNK_SIZE,
+)
 
 
 # =============================================================================
@@ -176,12 +183,10 @@ class TestParseAndTransformErpData:
 
 @pytest.mark.django_db
 class TestSyncErpToEshopTask:
-    """Tests for sync_erp_to_eshop Celery task."""
+    """Tests for sync_erp_to_eshop orchestrator task."""
     
-    @responses.activate
-    def test_successful_post_creates_sync_state(self, settings):
-        """Successful POST creates ProductSyncState record."""
-        # Prepare test data
+    def test_orchestrator_dispatches_new_products(self, settings):
+        """Orchestrator dispatches sub-tasks for new products."""
         test_data = [
             {
                 "id": "NEW-001",
@@ -192,14 +197,6 @@ class TestSyncErpToEshopTask:
             }
         ]
         
-        # Mock API response - 201 Created
-        responses.add(
-            responses.POST,
-            f"{ESHOP_API_BASE_URL}/",
-            json={"status": "created"},
-            status=201
-        )
-        
         with tempfile.TemporaryDirectory() as tmpdirname:
             tmp_dir_path = Path(tmpdirname)
             temp_path = tmp_dir_path / 'erp_data.json'
@@ -208,63 +205,17 @@ class TestSyncErpToEshopTask:
             
             with patch.object(settings, 'BASE_DIR', tmp_dir_path):
                 with patch('integrator.services.settings', settings):
-                    # Call task synchronously (without .delay())
-                    result = sync_erp_to_eshop()
+                    with patch('integrator.tasks.group') as mock_group:
+                        mock_group.return_value.apply_async = MagicMock()
+                        result = sync_erp_to_eshop()
             
-            # Verify sync state was created
-            assert ProductSyncState.objects.filter(sku='NEW-001').exists()
-            sync_state = ProductSyncState.objects.get(sku='NEW-001')
-            assert len(sync_state.data_hash) == 64  # SHA-256 hex length
-            
-            # Verify stats
-            assert result['created'] == 1
-            assert result['errors'] == 0
+            assert result['dispatched'] == 1
+            assert result['skipped'] == 0
+            assert result['total'] == 1
+            assert result['chunks'] == 1
     
-    @responses.activate
-    def test_rate_limit_429_triggers_retry(self, settings):
-        """429 response triggers task retry."""
-        # Prepare test data
-        test_data = [
-            {
-                "id": "RATE-001",
-                "title": "Rate Limited Product",
-                "price_vat_excl": 50.0,
-                "stocks": {},
-                "attributes": {}
-            }
-        ]
-        
-        # Mock API response - 429 Rate Limit
-        responses.add(
-            responses.POST,
-            f"{ESHOP_API_BASE_URL}/",
-            json={"error": "rate limit exceeded"},
-            status=429
-        )
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    # Patch retry method on the Celery task itself
-                    with patch('integrator.tasks.sync_erp_to_eshop.retry', side_effect=Exception("Retry triggered")) as mock_retry:
-                        # Call task normally
-                        with pytest.raises(Exception, match="Retry triggered"):
-                            sync_erp_to_eshop()
-                        
-                        # Verify retry was called with correct parameters
-                        mock_retry.assert_called_once()
-                        call_kwargs = mock_retry.call_args[1]
-                        assert call_kwargs['countdown'] == 10
-    
-    @responses.activate
     def test_unchanged_product_is_skipped(self, settings):
-        """Products with unchanged hash are skipped."""
-        # Prepare test data
+        """Products with unchanged hash are skipped by orchestrator."""
         test_data = [
             {
                 "id": "SKIP-001",
@@ -283,85 +234,189 @@ class TestSyncErpToEshopTask:
             
             with patch.object(settings, 'BASE_DIR', tmp_dir_path):
                 with patch('integrator.services.settings', settings):
-                    # First sync - should create
-                    responses.add(
-                        responses.POST,
-                        f"{ESHOP_API_BASE_URL}/",
-                        json={"status": "created"},
-                        status=201
-                    )
-                    result1 = sync_erp_to_eshop()
-                    assert result1['created'] == 1
+                    # Pre-create sync state with matching hash
+                    products = parse_and_transform_erp_data()
+                    product_hash = _calculate_hash(products[0])
+                    ProductSyncState.objects.create(sku='SKIP-001', data_hash=product_hash)
                     
-                    # Second sync - should skip (no API call needed)
-                    result2 = sync_erp_to_eshop()
-                    assert result2['skipped'] == 1
-                    assert result2['created'] == 0
-                    
-                    # Verify only one API call was made
-                    assert len(responses.calls) == 1
+                    with patch('integrator.tasks.group') as mock_group:
+                        result = sync_erp_to_eshop()
+            
+            assert result['skipped'] == 1
+            assert result['dispatched'] == 0
+            mock_group.assert_not_called()
+
+
+@pytest.mark.django_db
+class TestSyncProductToEshopTask:
+    """Tests for sync_product_to_eshop sub-task."""
     
     @responses.activate
-    def test_modified_product_triggers_patch(self, settings):
-        """Modified product (different hash) triggers PATCH."""
-        # First version of product
-        test_data_v1 = [
+    def test_successful_post_creates_sync_state(self):
+        """Successful POST creates ProductSyncState record."""
+        product = {
+            'sku': 'NEW-001',
+            'title': 'New Product',
+            'price_vat_incl': 121.0,
+            'stock_total': 10,
+            'color': 'blue'
+        }
+        product_hash = _calculate_hash(product)
+        
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/",
+            json={"status": "created"},
+            status=201
+        )
+        
+        result = sync_product_to_eshop(product, product_hash, is_new=True)
+        
+        assert result['status'] == 'created'
+        assert ProductSyncState.objects.filter(sku='NEW-001').exists()
+        sync_state = ProductSyncState.objects.get(sku='NEW-001')
+        assert sync_state.data_hash == product_hash
+    
+    @responses.activate
+    def test_successful_patch_updates_sync_state(self):
+        """Successful PATCH updates existing ProductSyncState."""
+        product = {
+            'sku': 'MOD-001',
+            'title': 'Modified Product',
+            'price_vat_incl': 150.0,
+            'stock_total': 5,
+            'color': 'red'
+        }
+        old_hash = 'old_hash_value'
+        new_hash = _calculate_hash(product)
+        
+        ProductSyncState.objects.create(sku='MOD-001', data_hash=old_hash)
+        
+        responses.add(
+            responses.PATCH,
+            f"{ESHOP_API_BASE_URL}/MOD-001/",
+            json={"status": "updated"},
+            status=200
+        )
+        
+        result = sync_product_to_eshop(product, new_hash, is_new=False)
+        
+        assert result['status'] == 'updated'
+        sync_state = ProductSyncState.objects.get(sku='MOD-001')
+        assert sync_state.data_hash == new_hash
+    
+    @responses.activate
+    def test_rate_limit_429_triggers_retry(self):
+        """429 response triggers task retry."""
+        product = {
+            'sku': 'RATE-001',
+            'title': 'Rate Limited Product',
+            'price_vat_incl': 50.0,
+            'stock_total': 0,
+            'color': 'N/A'
+        }
+        product_hash = _calculate_hash(product)
+        
+        responses.add(
+            responses.POST,
+            f"{ESHOP_API_BASE_URL}/",
+            json={"error": "rate limit exceeded"},
+            status=429
+        )
+        
+        with patch.object(sync_product_to_eshop, 'retry', side_effect=Exception("Retry triggered")) as mock_retry:
+            with pytest.raises(Exception, match="Retry triggered"):
+                sync_product_to_eshop(product, product_hash, is_new=True)
+            
+            mock_retry.assert_called_once()
+            call_kwargs = mock_retry.call_args[1]
+            assert call_kwargs['countdown'] == 10
+
+
+@pytest.mark.django_db
+class TestSyncProductChunkTask:
+    """Tests for sync_product_chunk sub-task (batch processing)."""
+    
+    @responses.activate
+    def test_chunk_creates_multiple_products(self):
+        """Chunk task successfully creates multiple products."""
+        chunk = [
             {
-                "id": "MOD-001",
-                "title": "Original Title",
-                "price_vat_excl": 100.0,
-                "stocks": {"warehouse": 5},
-                "attributes": {"color": "red"}
-            }
+                'product': {'sku': 'CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 121.0, 'stock_total': 10, 'color': 'red'},
+                'hash': _calculate_hash({'sku': 'CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 121.0, 'stock_total': 10, 'color': 'red'}),
+                'is_new': True,
+            },
+            {
+                'product': {'sku': 'CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 242.0, 'stock_total': 5, 'color': 'blue'},
+                'hash': _calculate_hash({'sku': 'CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 242.0, 'stock_total': 5, 'color': 'blue'}),
+                'is_new': True,
+            },
         ]
         
-        # Modified version
-        test_data_v2 = [
+        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
+        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
+        
+        result = sync_product_chunk(chunk)
+        
+        assert result['created'] == 2
+        assert result['updated'] == 0
+        assert result['errors'] == 0
+        assert ProductSyncState.objects.filter(sku='CHUNK-001').exists()
+        assert ProductSyncState.objects.filter(sku='CHUNK-002').exists()
+    
+    @responses.activate
+    def test_chunk_rate_limit_retries_entire_chunk(self):
+        """429 on any product in chunk triggers retry for entire chunk."""
+        chunk = [
             {
-                "id": "MOD-001",
-                "title": "Updated Title",  # Changed!
-                "price_vat_excl": 150.0,    # Changed!
-                "stocks": {"warehouse": 5},
-                "attributes": {"color": "red"}
-            }
+                'product': {'sku': 'RATE-CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 100.0, 'stock_total': 1, 'color': 'N/A'},
+                'hash': 'hash1',
+                'is_new': True,
+            },
+            {
+                'product': {'sku': 'RATE-CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 200.0, 'stock_total': 2, 'color': 'N/A'},
+                'hash': 'hash2',
+                'is_new': True,
+            },
         ]
         
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
+        # First product succeeds, second gets rate limited
+        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
+        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"error": "rate limit"}, status=429)
+        
+        with patch.object(sync_product_chunk, 'retry', side_effect=Exception("Chunk retry triggered")) as mock_retry:
+            with pytest.raises(Exception, match="Chunk retry triggered"):
+                sync_product_chunk(chunk)
             
-            # Write first version
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data_v1, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    # First sync - POST
-                    responses.add(
-                        responses.POST,
-                        f"{ESHOP_API_BASE_URL}/",
-                        json={"status": "created"},
-                        status=201
-                    )
-                    result1 = sync_erp_to_eshop()
-                    assert result1['created'] == 1
-                    
-                    old_hash = ProductSyncState.objects.get(sku='MOD-001').data_hash
-                    
-                    # Update file with new data
-                    with open(temp_path, 'w', encoding='utf-8') as f:
-                        json.dump(test_data_v2, f)
-                    
-                    # Second sync - should PATCH
-                    responses.add(
-                        responses.PATCH,
-                        f"{ESHOP_API_BASE_URL}/MOD-001/",
-                        json={"status": "updated"},
-                        status=200
-                    )
-                    result2 = sync_erp_to_eshop()
-                    assert result2['updated'] == 1
-                    
-                    new_hash = ProductSyncState.objects.get(sku='MOD-001').data_hash
-                    assert old_hash != new_hash  # Hash should be different
+            mock_retry.assert_called_once()
+            call_kwargs = mock_retry.call_args[1]
+            assert call_kwargs['countdown'] == 10
+    
+    @responses.activate
+    def test_chunk_mixed_create_and_update(self):
+        """Chunk handles mix of new and existing products."""
+        # Pre-create one product
+        ProductSyncState.objects.create(sku='MIX-002', data_hash='old_hash')
+        
+        chunk = [
+            {
+                'product': {'sku': 'MIX-001', 'title': 'New Product', 'price_vat_incl': 100.0, 'stock_total': 1, 'color': 'green'},
+                'hash': 'new_hash_1',
+                'is_new': True,
+            },
+            {
+                'product': {'sku': 'MIX-002', 'title': 'Updated Product', 'price_vat_incl': 200.0, 'stock_total': 2, 'color': 'yellow'},
+                'hash': 'new_hash_2',
+                'is_new': False,
+            },
+        ]
+        
+        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
+        responses.add(responses.PATCH, f"{ESHOP_API_BASE_URL}/MIX-002/", json={"status": "updated"}, status=200)
+        
+        result = sync_product_chunk(chunk)
+        
+        assert result['created'] == 1
+        assert result['updated'] == 1
+        assert result['errors'] == 0
 
