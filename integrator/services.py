@@ -8,24 +8,6 @@ from django.conf import settings
 
 
 def parse_and_transform_erp_data(file_path: str = 'erp_data.json') -> list[dict]:
-    """
-    Parse ERP JSON data and transform it for e-shop API.
-    
-    Handles edge cases:
-    - Duplicate SKUs (keeps the last occurrence)
-    - Invalid stock values (e.g., "N/A") → treated as 0
-    - Null or negative prices → treated as 0.0
-    - Missing or null attributes/color → defaults to "N/A"
-    
-    Returns:
-        List of transformed product dictionaries with keys:
-        - sku: Product SKU
-        - title: Product title
-        - price_vat_incl: Price including 21% VAT, rounded to 2 decimals
-        - stock_total: Sum of all stock values
-        - color: Product color or "N/A"
-    """
-    # Resolve file path relative to BASE_DIR
     full_path = Path(settings.BASE_DIR) / file_path
     
     with open(full_path, 'r', encoding='utf-8') as f:
@@ -86,14 +68,16 @@ def _calculate_stock_total(stocks: dict | None) -> int:
     return total
 
 
-def _calculate_price_with_vat(price: float | None) -> float:
+def _calculate_price_with_vat(price: float | None) -> Decimal:
     """
     Calculate price including 21% VAT.
-    Null or negative prices are treated as 0.0.
-    Uses Decimal for precise financial calculations.
+    Null or negative prices are treated as Decimal('0.00').
+    
+    Returns Decimal to preserve precision for financial calculations.
+    Conversion to float/string should only happen at system boundaries (e.g., JSON serialization).
     """
     if price is None or not isinstance(price, (int, float)) or price < 0:
-        return 0.0
+        return Decimal('0.00')
     
     # Use Decimal for precise financial calculations
     base_price = Decimal(str(price))
@@ -104,7 +88,7 @@ def _calculate_price_with_vat(price: float | None) -> float:
         Decimal('0.01'), rounding=ROUND_HALF_UP
     )
     
-    return float(price_with_vat)
+    return price_with_vat
 
 
 def _extract_color(attributes: dict | None) -> str:

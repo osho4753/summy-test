@@ -7,17 +7,19 @@ services:
       - POSTGRES_USER=postgres
       - POSTGRES_PASSWORD=postgres
     ports:
-      - "5433:5432"
+      - '5433:5432'
   redis:
     image: redis:7-alpine
   web:
     build: .
     command: python manage.py runserver 0.0.0.0:8000
     volumes: ['.:/app']
-    ports: ["8000:8000"]
+    ports: ['8000:8000']
     environment:
       - DATABASE_URL=postgres://postgres:postgres@db:5432/symmy_task
       - CELERY_BROKER_URL=redis://redis:6379/0
+      - ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1/products
+      - ESHOP_API_KEY=${ESHOP_API_KEY}
     depends_on: [db, redis]
   worker:
     build: .
@@ -26,4 +28,6 @@ services:
     environment:
       - DATABASE_URL=postgres://postgres:postgres@db:5432/symmy_task
       - CELERY_BROKER_URL=redis://redis:6379/0
+      - ESHOP_API_BASE_URL=https://api.fake-eshop.cz/v1/products
+      - ESHOP_API_KEY=${ESHOP_API_KEY}
     depends_on: [db, redis]

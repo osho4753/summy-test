@@ -132,3 +132,7 @@ CELERY_BROKER_URL = os.environ.get("CELERY_BROKER_URL", "redis://redis:6379/0")
 CELERY_RESULT_BACKEND = CELERY_BROKER_URL
 CELERY_ACCEPT_CONTENT = ['json']
 CELERY_TASK_SERIALIZER = 'json'
+
+# E-shop API configuration
+ESHOP_API_BASE_URL = os.environ.get("ESHOP_API_BASE_URL", "https://api.fake-eshop.cz/v1/products")
+ESHOP_API_KEY = os.environ.get("ESHOP_API_KEY", "")

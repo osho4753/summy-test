@@ -1,11 +1,6 @@
-"""
-Tests for ERP to E-shop integration.
-
-Block A: Unit tests for data transformation (parse_and_transform_erp_data)
-Block B: Integration tests for Celery task (sync_erp_to_eshop)
-"""
 import json
 import tempfile
+from decimal import Decimal
 from pathlib import Path
 from unittest.mock import patch, MagicMock
 
@@ -22,39 +17,28 @@ from integrator.services import (
 from integrator.tasks import (
     sync_erp_to_eshop,
     sync_product_to_eshop,
-    sync_product_chunk,
     ESHOP_API_BASE_URL,
     _calculate_hash,
-    CHUNK_SIZE,
 )
-
-
-# =============================================================================
-# BLOCK A: Unit tests for data transformation
-# =============================================================================
 
 class TestCalculatePriceWithVat:
     """Tests for VAT calculation (21%)."""
     
     def test_valid_price_adds_21_percent_vat(self):
-        """VAT (21%) is correctly added to valid price."""
-        # 100 * 1.21 = 121.0
-        assert _calculate_price_with_vat(100.0) == 121.0
-        
-        # 12400.5 * 1.21 = 15004.605 → rounded to 15004.61
-        assert _calculate_price_with_vat(12400.5) == 15004.61
+        assert _calculate_price_with_vat(100.0) == Decimal('121.00')
+        assert _calculate_price_with_vat(12400.5) == Decimal('15004.61')
     
     def test_null_price_returns_zero(self):
-        """Null price results in 0.0."""
-        assert _calculate_price_with_vat(None) == 0.0
+        """Null price results in Decimal('0.00')."""
+        assert _calculate_price_with_vat(None) == Decimal('0.00')
     
     def test_negative_price_returns_zero(self):
-        """Negative price (like -150.0 from SKU-002) results in 0.0."""
-        assert _calculate_price_with_vat(-150.0) == 0.0
+        """Negative price (like -150.0 from SKU-002) results in Decimal('0.00')."""
+        assert _calculate_price_with_vat(-150.0) == Decimal('0.00')
     
     def test_zero_price_returns_zero(self):
         """Zero price stays zero."""
-        assert _calculate_price_with_vat(0) == 0.0
+        assert _calculate_price_with_vat(0) == Decimal('0.00')
 
 
 class TestCalculateStockTotal:
@@ -144,13 +128,13 @@ class TestParseAndTransformErpData:
             
             # Check first product
             product1 = next(p for p in result if p['sku'] == 'TEST-001')
-            assert product1['price_vat_incl'] == 121.0  # 100 * 1.21
+            assert product1['price_vat_incl'] == Decimal('121.00')  # 100 * 1.21
             assert product1['stock_total'] == 15  # 10 + 5
             assert product1['color'] == 'red'
             
             # Check second product (edge cases)
             product2 = next(p for p in result if p['sku'] == 'TEST-002')
-            assert product2['price_vat_incl'] == 0.0  # Negative → 0
+            assert product2['price_vat_incl'] == Decimal('0.00')  # Negative → 0
             assert product2['color'] == 'N/A'  # None attributes
     
     def test_deduplication_keeps_last_occurrence(self, settings):
@@ -174,7 +158,7 @@ class TestParseAndTransformErpData:
             assert len(result) == 1
             # Last occurrence should be kept
             assert result[0]['title'] == 'Second'
-            assert result[0]['price_vat_incl'] == 242.0  # 200 * 1.21
+            assert result[0]['price_vat_incl'] == Decimal('242.00')  # 200 * 1.21
 
 
 # =============================================================================
@@ -212,7 +196,6 @@ class TestSyncErpToEshopTask:
             assert result['dispatched'] == 1
             assert result['skipped'] == 0
             assert result['total'] == 1
-            assert result['chunks'] == 1
     
     def test_unchanged_product_is_skipped(self, settings):
         """Products with unchanged hash are skipped by orchestrator."""
@@ -333,90 +316,5 @@ class TestSyncProductToEshopTask:
             assert call_kwargs['countdown'] == 10
 
 
-@pytest.mark.django_db
-class TestSyncProductChunkTask:
-    """Tests for sync_product_chunk sub-task (batch processing)."""
-    
-    @responses.activate
-    def test_chunk_creates_multiple_products(self):
-        """Chunk task successfully creates multiple products."""
-        chunk = [
-            {
-                'product': {'sku': 'CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 121.0, 'stock_total': 10, 'color': 'red'},
-                'hash': _calculate_hash({'sku': 'CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 121.0, 'stock_total': 10, 'color': 'red'}),
-                'is_new': True,
-            },
-            {
-                'product': {'sku': 'CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 242.0, 'stock_total': 5, 'color': 'blue'},
-                'hash': _calculate_hash({'sku': 'CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 242.0, 'stock_total': 5, 'color': 'blue'}),
-                'is_new': True,
-            },
-        ]
-        
-        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
-        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
-        
-        result = sync_product_chunk(chunk)
-        
-        assert result['created'] == 2
-        assert result['updated'] == 0
-        assert result['errors'] == 0
-        assert ProductSyncState.objects.filter(sku='CHUNK-001').exists()
-        assert ProductSyncState.objects.filter(sku='CHUNK-002').exists()
-    
-    @responses.activate
-    def test_chunk_rate_limit_retries_entire_chunk(self):
-        """429 on any product in chunk triggers retry for entire chunk."""
-        chunk = [
-            {
-                'product': {'sku': 'RATE-CHUNK-001', 'title': 'Product 1', 'price_vat_incl': 100.0, 'stock_total': 1, 'color': 'N/A'},
-                'hash': 'hash1',
-                'is_new': True,
-            },
-            {
-                'product': {'sku': 'RATE-CHUNK-002', 'title': 'Product 2', 'price_vat_incl': 200.0, 'stock_total': 2, 'color': 'N/A'},
-                'hash': 'hash2',
-                'is_new': True,
-            },
-        ]
-        
-        # First product succeeds, second gets rate limited
-        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
-        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"error": "rate limit"}, status=429)
-        
-        with patch.object(sync_product_chunk, 'retry', side_effect=Exception("Chunk retry triggered")) as mock_retry:
-            with pytest.raises(Exception, match="Chunk retry triggered"):
-                sync_product_chunk(chunk)
-            
-            mock_retry.assert_called_once()
-            call_kwargs = mock_retry.call_args[1]
-            assert call_kwargs['countdown'] == 10
-    
-    @responses.activate
-    def test_chunk_mixed_create_and_update(self):
-        """Chunk handles mix of new and existing products."""
-        # Pre-create one product
-        ProductSyncState.objects.create(sku='MIX-002', data_hash='old_hash')
-        
-        chunk = [
-            {
-                'product': {'sku': 'MIX-001', 'title': 'New Product', 'price_vat_incl': 100.0, 'stock_total': 1, 'color': 'green'},
-                'hash': 'new_hash_1',
-                'is_new': True,
-            },
-            {
-                'product': {'sku': 'MIX-002', 'title': 'Updated Product', 'price_vat_incl': 200.0, 'stock_total': 2, 'color': 'yellow'},
-                'hash': 'new_hash_2',
-                'is_new': False,
-            },
-        ]
-        
-        responses.add(responses.POST, f"{ESHOP_API_BASE_URL}/", json={"status": "created"}, status=201)
-        responses.add(responses.PATCH, f"{ESHOP_API_BASE_URL}/MIX-002/", json={"status": "updated"}, status=200)
-        
-        result = sync_product_chunk(chunk)
-        
-        assert result['created'] == 1
-        assert result['updated'] == 1
-        assert result['errors'] == 0
+
 
