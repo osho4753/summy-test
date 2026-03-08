@@ -9,8 +9,9 @@ import responses
 
 from integrator.models import ProductSyncState
 from integrator.schemas import ProductSchema
-from integrator.services import stream_erp_data_in_batches
-from integrator.tasks import sync_erp_to_eshop, process_sync_batch, init_worker_session
+from integrator.services import stream_erp_data
+from integrator.tasks import sync_erp_to_eshop, sync_single_product, init_worker_session
+
 
 # =============================================================================
 # 1: Validation tests (Pydantic)
@@ -29,9 +30,12 @@ class TestProductSchemaValidation:
         product = ProductSchema(**raw_data)
         
         assert product.sku == "SKU-001"
-        assert product.price_vat_incl == Decimal('121.00')  # 100 * 1.21
-        assert product.stock_total == 8                     # 5 + 3
+        assert product.price_vat_incl == Decimal('121.00')
+        assert product.stock_total == 8                    
         assert product.color == "stříbrná"
+        
+        payload = product.to_eshop_payload()
+        assert payload['price_vat_incl'] == '121.00' 
 
     def test_edge_cases_and_nulls(self):
         raw_data = {
@@ -39,7 +43,7 @@ class TestProductSchemaValidation:
             "title": "Chyba",
             "price_vat_excl": -150.0,       
             "stocks": {"praha": "N/A"},     
-            "attributes": None             
+            "attributes": None            
         }
         product = ProductSchema(**raw_data)
         
@@ -49,16 +53,16 @@ class TestProductSchemaValidation:
 
 
 # =============================================================================
-# 2: batches generator tests
+# 2: Testing streaming data processing from ERP (ijson + Pydantic) 
 # =============================================================================
 
 @pytest.mark.django_db
 class TestStreamErpData:
-    def test_stream_erp_data_in_batches(self, settings):
+
+    def test_stream_erp_data_yields_schemas(self, settings):
         test_data = [
             {"id": "TEST-001", "title": "First", "price_vat_excl": 100},
             {"id": "TEST-002", "title": "Second", "price_vat_excl": 200},
-            {"id": "TEST-003", "title": "Third", "price_vat_excl": 300},
         ]
         
         with tempfile.TemporaryDirectory() as tmpdirname:
@@ -68,60 +72,58 @@ class TestStreamErpData:
                 json.dump(test_data, f)
             
             with patch.object(settings, 'BASE_DIR', tmp_dir):
-                batches = list(stream_erp_data_in_batches(batch_size=2))
+                items = list(stream_erp_data())
         
-        assert len(batches) == 2
-        assert len(batches[0]) == 2
-        assert len(batches[1]) == 1
-        assert batches[0][0]['sku'] == 'TEST-001'
-        assert batches[1][0]['sku'] == 'TEST-003'
-
-    def test_deduplication_keeps_last_occurrence(self, settings):
-        test_data = [
-            {"id": "DUP-001", "title": "Old", "price_vat_excl": 100},
-            {"id": "DUP-001", "title": "New", "price_vat_excl": 200},
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir = Path(tmpdirname)
-            temp_path = tmp_dir / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir):
-                batches = list(stream_erp_data_in_batches(batch_size=5))
-        
-        assert len(batches) == 1
-        assert len(batches[0]) == 1
-        assert batches[0][0]['title'] == 'New'
-        assert batches[0][0]['price_vat_incl'] == '242.00'
+        assert len(items) == 2
+        assert isinstance(items[0], ProductSchema)
+        assert items[0].sku == 'TEST-001'
+        assert items[1].price_vat_incl == Decimal('242.00')
 
 
 # =============================================================================
-# 3: Celery tasks tests
+# 3: Celery tasks orchestrator
 # =============================================================================
 
 @pytest.mark.django_db
 class TestCeleryTasks:
+    """Тесты оркестратора и атомарных задач."""
+
     def setup_method(self):
         init_worker_session()
 
-    @patch('integrator.tasks.process_sync_batch.delay')
-    @patch('integrator.tasks.stream_erp_data_in_batches')
-    def test_sync_erp_to_eshop_orchestrator(self, mock_stream, mock_delay):
-        mock_stream.return_value = [[{"sku": "1"}], [{"sku": "2"}], [{"sku": "3"}]]
+    @patch('integrator.tasks.sync_single_product.delay')
+    def test_sync_erp_to_eshop_orchestrator(self, mock_delay, settings):
+        test_data = [
+            {"id": "NEW-001", "title": "New", "price_vat_excl": 100},
+            {"id": "SKIP-001", "title": "Old", "price_vat_excl": 100},
+        ]
         
-        result = sync_erp_to_eshop()
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            tmp_dir = Path(tmpdirname)
+            temp_path = tmp_dir / 'erp_data.json'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(test_data, f)
+            
+            with patch.object(settings, 'BASE_DIR', tmp_dir):
+                schema = ProductSchema(**test_data[1])
+                payload = schema.to_eshop_payload()
+                import hashlib
+                import json as base_json
+                hash_val = hashlib.sha256(base_json.dumps(payload, sort_keys=True).encode()).hexdigest()
+                ProductSyncState.objects.create(sku="SKIP-001", data_hash=hash_val)
+
+                result = sync_erp_to_eshop()
         
-        assert result['dispatched_batches'] == 3
-        assert mock_delay.call_count == 3
+        assert result['dispatched_tasks'] == 1
+        assert mock_delay.call_count == 1
+        
+        called_payload = mock_delay.call_args[0][0]
+        assert called_payload['sku'] == 'NEW-001'
 
     @responses.activate
-    def test_process_sync_batch_success(self, settings):
-        batch = [
-            {'sku': 'NEW-001', 'title': 'P1', 'price_vat_incl': '121.00', 'stock_total': 10, 'color': 'red'},
-            {'sku': 'NEW-002', 'title': 'P2', 'price_vat_incl': '242.00', 'stock_total': 5, 'color': 'blue'}
-        ]
+    def test_sync_single_product_success(self, settings):
+        payload = {'sku': 'NEW-001', 'title': 'P1', 'price_vat_incl': '121.00', 'stock_total': 10, 'color': 'red'}
+        prod_hash = "fake_hash_123"
         
         responses.add(
             responses.POST,
@@ -130,17 +132,14 @@ class TestCeleryTasks:
             status=201
         )
         
-        process_sync_batch(batch)
+        sync_single_product(payload, prod_hash, is_new=True)
         
-        assert ProductSyncState.objects.count() == 2
-        assert ProductSyncState.objects.filter(sku='NEW-001').exists()
-        assert ProductSyncState.objects.filter(sku='NEW-002').exists()
+        assert ProductSyncState.objects.filter(sku='NEW-001', data_hash=prod_hash).exists()
 
     @responses.activate
-    def test_process_sync_batch_rate_limit_retry(self, settings):
-        batch = [
-            {'sku': 'RATE-001', 'title': 'Test', 'price_vat_incl': '50.00', 'stock_total': 0, 'color': 'N/A'}
-        ]
+    def test_sync_single_product_rate_limit_retry(self, settings):
+        payload = {'sku': 'RATE-001', 'title': 'Test', 'price_vat_incl': '50.00', 'stock_total': 0, 'color': 'N/A'}
+        prod_hash = "fake_hash_456"
         
         responses.add(
             responses.POST,
@@ -150,9 +149,9 @@ class TestCeleryTasks:
             headers={"Retry-After": "15"}
         )
         
-        with patch.object(process_sync_batch, 'retry', side_effect=Exception("Retry Triggered")) as mock_retry:
-            with pytest.raises(Exception, match="Retry Triggered"):
-                process_sync_batch(batch)
+        with patch.object(sync_single_product, 'retry', side_effect=Exception("Rate Limit 429")) as mock_retry:
+            with pytest.raises(Exception, match="Rate Limit 429"):
+                sync_single_product(payload, prod_hash, is_new=True)
             
             mock_retry.assert_called_once()
             call_kwargs = mock_retry.call_args[1]

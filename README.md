@@ -4,12 +4,12 @@ A robust, production-ready Django application for synchronizing large-scale ERP 
 
 ## 🚀 Key Architectural Features
 
-- **Memory-Efficient Processing (Stream Parsing)** — Uses `ijson` to read massive JSON files in chunks. Eliminates Out-Of-Memory (OOM) risks regardless of the ERP dump size.
-- **Strict Data Validation** — Powered by `Pydantic`. Ensures bulletproof type coercion, handles edge cases (e.g., negative prices, missing attributes), and encapsulates business logic.
-- **Optimized Database I/O** — Drastically reduces database load by using batched `bulk_create` with conflict resolution (`update_conflicts=True`) instead of thousands of isolated transactions.
-- **Smart Rate Limiting** — Advanced 429 Error handling. Respects external API limits by dynamically reading `Retry-After` headers and utilizing **Exponential Backoff with Jitter** to prevent "Thundering Herd" DDoS scenarios.
-- **Delta Sync** — Sends only changed data based on SHA-256 hashing to minimize network overhead.
-- **Safe Prefork Networking** — HTTP Sessions are securely initialized per-worker-process via Celery signals to prevent socket corruption.
+- **Atomic Task Processing (Anti-Poison Pill)** — Adopts a strict "1 task = 1 product" pattern. Long-running blocking batches are eliminated. If a network drop or 429 error occurs, only the affected product is retried, ensuring zero state loss and preventing endless retry loops.
+- **Proactive Rate Limiting** — Instead of reactively spamming the API until a `429 Too Many Requests` is hit, the system utilizes Celery's native Token Bucket algorithm (`rate_limit='5/s'`). Requests are smoothly dripped to the external API, naturally preventing bans and database write spikes (max 5 TPS).
+- **Memory-Efficient Stream Parsing** — Uses `ijson` to read massive JSON dumps iteratively. Eliminates Out-Of-Memory (OOM) risks regardless of the ERP file size.
+- **Declarative Data Validation** — Powered by `Pydantic`. Raw inputs are never mutated (no dirty hacks). Business logic (VAT calculation, stock aggregation) is cleanly encapsulated using `@computed_field` and `@field_validator`.
+- **Optimized Delta Sync (Bulk Read)** — The orchestrator buffers hashes and queries the database in chunks (Bulk Read) to prevent N+1 queries, dispatching Celery tasks _only_ for genuinely new or modified products.
+- **Safe Prefork Networking** — HTTP Sessions are securely initialized per-worker-process via Celery signals (`worker_process_init`) to prevent socket corruption.
 
 ## 🛠 Tech Stack
 
@@ -31,6 +31,7 @@ git clone <repo-url>
 cd symmy-task
 docker-compose up -d --build
 ```
+
 ````
 
 ### 2. Apply Migrations
@@ -42,13 +43,14 @@ docker-compose exec web python manage.py migrate
 
 ### 3. Run Sync Task
 
-The background worker starts automatically via Docker Compose. Trigger the orchestrator task from the Django shell:
+The background worker starts automatically. Trigger the orchestrator task from the Django shell:
 
 ```bash
 docker-compose exec web python manage.py shell
 
 >>> from integrator.tasks import sync_erp_to_eshop
 >>> sync_erp_to_eshop.delay()
+# The orchestrator will instantly dispatch atomic tasks (sync_single_product) to the broker
 
 ```
 
@@ -59,9 +61,9 @@ symmy-task/
 ├── core/                    # Django project configuration
 ├── integrator/              # Integration app
 │   ├── models.py            # ProductSyncState (Delta Sync)
-│   ├── schemas.py           # Pydantic schemas (Validation & Transformation)
-│   ├── services.py          # Stream parsing logic (ijson chunks)
-│   ├── tasks.py             # Celery tasks (Orchestrator & Batch Processing)
+│   ├── schemas.py           # Pydantic models (Declarative @computed_fields)
+│   ├── services.py          # ijson stream parsing generator
+│   ├── tasks.py             # Celery tasks (Orchestrator & Atomic `sync_single_product`)
 │   ├── tests.py             # Pytest suite with mock responses
 │   └── admin.py             # Admin panel
 ├── erp_data.json            # ERP test data
@@ -111,3 +113,4 @@ docker-compose exec web pytest integrator/tests.py -v
 | `CELERY_BROKER_URL`  | `redis://redis:6379/0`                  |
 | `ESHOP_API_BASE_URL` | `https://api.fake-eshop.cz/v1/products` |
 | `ESHOP_API_KEY`      | _Empty string_                          |
+````

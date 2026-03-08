@@ -1,41 +1,44 @@
-from typing import Any
 from decimal import Decimal, ROUND_HALF_UP
-from pydantic import BaseModel, Field, model_validator
+from typing import Optional, Dict, Any
+from pydantic import BaseModel, Field, computed_field
 
 class ProductSchema(BaseModel):
     sku: str = Field(alias="id")
     title: str
-    price_vat_incl: Decimal = Decimal('0.00')
-    stock_total: int = 0
-    color: str = "N/A"
+    price_vat_excl: Optional[float] = None
+    stocks: Optional[Dict[str, Any]] = None
+    attributes: Optional[Dict[str, Any]] = None
 
-    @model_validator(mode='before')
-    @classmethod
-    def transform_erp_data(cls, data: Any) -> Any:
-        if not isinstance(data, dict):
-            return data
-            
-        price_excl = data.get('price_vat_excl')
-        if isinstance(price_excl, (int, float)) and price_excl > 0:
-            price_incl = (Decimal(str(price_excl)) * Decimal('1.21')).quantize(
-                Decimal('0.01'), rounding=ROUND_HALF_UP
-            )
-            data['price_vat_incl'] = price_incl
-        else:
-            data['price_vat_incl'] = Decimal('0.00')
+    @computed_field
+    @property
+    def price_vat_incl(self) -> Decimal:
+        if self.price_vat_excl is not None and self.price_vat_excl > 0:
+            val = Decimal(str(self.price_vat_excl)) * Decimal('1.21')
+            return val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
+        return Decimal('0.00')
 
-        stocks = data.get('stocks')
-        stock_total = 0
-        if isinstance(stocks, dict):
-            for v in stocks.values():
-                if isinstance(v, (int, float)) and not isinstance(v, bool):
-                    stock_total += int(v)
-        data['stock_total'] = stock_total
+    @computed_field
+    @property
+    def stock_total(self) -> int:
+        if not self.stocks:
+            return 0
+        return sum(
+            int(v) for v in self.stocks.values()
+            if isinstance(v, (int, float)) and not isinstance(v, bool)
+        )
 
-        attributes = data.get('attributes')
-        if isinstance(attributes, dict) and attributes.get('color'):
-            data['color'] = str(attributes['color'])
-        else:
-            data['color'] = "N/A"
+    @computed_field
+    @property
+    def color(self) -> str:
+        if self.attributes and isinstance(self.attributes, dict):
+            return str(self.attributes.get('color', 'N/A'))
+        return 'N/A'
 
-        return data
+    def to_eshop_payload(self) -> dict:
+        return {
+            "sku": self.sku,
+            "title": self.title,
+            "price_vat_incl": str(self.price_vat_incl), 
+            "stock_total": self.stock_total,
+            "color": self.color,
+        }
