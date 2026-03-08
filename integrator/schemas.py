@@ -1,6 +1,7 @@
 from decimal import Decimal, ROUND_HALF_UP
 from typing import Optional, Dict, Any
 from pydantic import BaseModel, Field, computed_field
+from django.conf import settings
 
 class ProductSchema(BaseModel):
     sku: str = Field(alias="id")
@@ -13,7 +14,7 @@ class ProductSchema(BaseModel):
     @property
     def price_vat_incl(self) -> Decimal:
         if self.price_vat_excl is not None and self.price_vat_excl > 0:
-            val = Decimal(str(self.price_vat_excl)) * Decimal('1.21')
+            val = Decimal(str(self.price_vat_excl)) * Decimal(str(settings.VAT_MULTIPLIER))
             return val.quantize(Decimal('0.01'), rounding=ROUND_HALF_UP)
         return Decimal('0.00')
 

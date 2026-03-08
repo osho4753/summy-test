@@ -136,3 +136,5 @@ CELERY_TASK_SERIALIZER = 'json'
 # E-shop API configuration
 ESHOP_API_BASE_URL = os.environ.get("ESHOP_API_BASE_URL", "https://api.fake-eshop.cz/v1/products")
 ESHOP_API_KEY = os.environ.get("ESHOP_API_KEY", "")
+
+VAT_MULTIPLIER = os.environ.get("VAT_MULTIPLIER", "1.21")

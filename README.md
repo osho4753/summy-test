@@ -1,21 +1,21 @@
 # Symmy Task — Highload ERP to E-shop Integration
 
-A robust, production-ready Django application for synchronizing large-scale ERP data to an e-shop via Celery. Designed with high-load principles, memory efficiency, and strict data validation in mind.
+A robust, production-ready Django application for synchronizing large-scale ERP data to an e-shop via Celery. Designed with high-load principles, memory efficiency, and strict network/database optimization in mind.
 
 ## 🚀 Key Architectural Features
 
-- **Atomic Task Processing (Anti-Poison Pill)** — Adopts a strict "1 task = 1 product" pattern. Long-running blocking batches are eliminated. If a network drop or 429 error occurs, only the affected product is retried, ensuring zero state loss and preventing endless retry loops.
-- **Proactive Rate Limiting** — Instead of reactively spamming the API until a `429 Too Many Requests` is hit, the system utilizes Celery's native Token Bucket algorithm (`rate_limit='5/s'`). Requests are smoothly dripped to the external API, naturally preventing bans and database write spikes (max 5 TPS).
+- **Non-blocking Rate Limiting** — API rate limits (5 req/s) and `429 Too Many Requests` are handled natively via Celery's `rate_limit` and non-blocking `self.retry()`. No threads or workers are ever put to sleep (`time.sleep`), ensuring maximum throughput and preventing worker starvation.
+- **Zero N+1 Database Writes (Celery Chords)** — Writing synchronization states to the database one by one would crush the DB under high load. This system uses `celery.chord` to dispatch a batch of atomic HTTP tasks, gather their successful results, and write them to PostgreSQL in a single `bulk_create`/`bulk_update` query.
+- **Smart API Fallback (POST -> PATCH)** — Local database state is treated as a cache, not the absolute source of truth. If a `POST` request fails with a `409 Conflict` (or `400` duplicate error), the API Client automatically falls back to a `PATCH` request, making the synchronization highly resilient to state mismatches.
+- **Class-Based Task Connection Pooling** — HTTP Sessions are preserved across task executions to reduce socket overhead. Instead of using anti-patterns like global variables and signal hooks, this is cleanly achieved using Custom Class-Based Celery Tasks (`celery.Task` inheritance).
 - **Memory-Efficient Stream Parsing** — Uses `ijson` to read massive JSON dumps iteratively. Eliminates Out-Of-Memory (OOM) risks regardless of the ERP file size.
-- **Declarative Data Validation** — Powered by `Pydantic`. Raw inputs are never mutated (no dirty hacks). Business logic (VAT calculation, stock aggregation) is cleanly encapsulated using `@computed_field` and `@field_validator`.
-- **Optimized Delta Sync (Bulk Read)** — The orchestrator buffers hashes and queries the database in chunks (Bulk Read) to prevent N+1 queries, dispatching Celery tasks _only_ for genuinely new or modified products.
-- **Safe Prefork Networking** — HTTP Sessions are securely initialized per-worker-process via Celery signals (`worker_process_init`) to prevent socket corruption.
+- **Declarative Data Validation** — Powered by `Pydantic`. Raw inputs are never mutated. Business logic is cleanly encapsulated, and magic numbers (like VAT) are moved to environment variables.
 
 ## 🛠 Tech Stack
 
 - Python 3.11+
 - Django 5.2
-- Celery + Redis
+- Celery + Redis (Message Broker & Result Backend for Chords)
 - PostgreSQL
 - **Pydantic** (Validation & Transformation)
 - **ijson** (Stream Parsing)
@@ -50,7 +50,6 @@ docker-compose exec web python manage.py shell
 
 >>> from integrator.tasks import sync_erp_to_eshop
 >>> sync_erp_to_eshop.delay()
-# The orchestrator will instantly dispatch atomic tasks (sync_single_product) to the broker
 
 ```
 
@@ -61,22 +60,22 @@ symmy-task/
 ├── core/                    # Django project configuration
 ├── integrator/              # Integration app
 │   ├── models.py            # ProductSyncState (Delta Sync)
-│   ├── schemas.py           # Pydantic models (Declarative @computed_fields)
+│   ├── schemas.py           # Pydantic models (Declarative validation)
 │   ├── services.py          # ijson stream parsing generator
-│   ├── tasks.py             # Celery tasks (Orchestrator & Atomic `sync_single_product`)
+│   ├── tasks.py             # Celery tasks (Orchestrator, Atomic Sync, Bulk Save)
+│   ├── api_client.py        # Smart HTTP Client with Fallback logic
 │   ├── tests.py             # Pytest suite with mock responses
 │   └── admin.py             # Admin panel
 ├── erp_data.json            # ERP test data
 ├── docker-compose.yml
 ├── Dockerfile
-├── requirements.txt
-└── pytest.ini
+└── requirements.txt
 
 ```
 
-## 🔄 Transformation Logic (Pydantic Schema)
+## 🔄 Transformation Logic
 
-- **Price:** `price_vat_incl = round(price_vat_excl * 1.21, 2)`. Null, missing, or negative values automatically default to `0.00`.
+- **Price:** `price_vat_incl = price_vat_excl * VAT_MULTIPLIER`. Null, missing, or negative values automatically default to `0.00`. The VAT multiplier is configurable via `.env`.
 - **Stock:** `stock_total = sum(valid_numeric_stocks)`. Invalid values (e.g., `"N/A"`, booleans) are safely ignored.
 - **Color:** Safely extracted from nested `attributes`. Defaults to `"N/A"` if missing.
 
@@ -91,7 +90,7 @@ Authentication: `{"X-Api-Key": "symma-secret-token"}`
 
 ## 🧪 Testing
 
-The project includes a robust testing suite focusing on schema validation, chunking, and Celery retries.
+The project includes a robust testing suite focusing on schema validation, high-load architecture (bulk database writes), and API resilience (Fallback & Rate Limiting).
 
 ```bash
 # Run tests with verbosity
@@ -99,18 +98,16 @@ docker-compose exec web pytest integrator/tests.py -v
 
 ```
 
-**Test Coverage Highlights:**
-
-- `Pydantic` schema transformation and edge-case handling.
-- Batched stream parsing deduplication.
-- API mocking via `responses` for successful POST/PATCH batch syncs.
-- Retry mechanisms and Rate Limit handling verification.
-
 ## 🔧 Environment Variables
 
-| Variable             | Default Value                           |
-| -------------------- | --------------------------------------- |
-| `CELERY_BROKER_URL`  | `redis://redis:6379/0`                  |
-| `ESHOP_API_BASE_URL` | `https://api.fake-eshop.cz/v1/products` |
-| `ESHOP_API_KEY`      | _Empty string_                          |
+| Variable             | Default Value                           | Description                           |
+| -------------------- | --------------------------------------- | ------------------------------------- |
+| `CELERY_BROKER_URL`  | `redis://redis:6379/0`                  | Redis connection string               |
+| `ESHOP_API_BASE_URL` | `https://api.fake-eshop.cz/v1/products` | Target e-shop API endpoint            |
+| `ESHOP_API_KEY`      | _Empty string_                          | Secret token for API auth             |
+| `VAT_MULTIPLIER`     | `1.21`                                  | Configurable VAT rate (e.g., 21% tax) |
+
+```
+
+```
 ````

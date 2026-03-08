@@ -5,20 +5,22 @@ import random
 from celery import shared_task
 from celery.signals import worker_process_init
 from requests.exceptions import RequestException
-
+from celery import chord
+from celery import Task
 from .models import ProductSyncState
 from .services import stream_erp_data
 from .api_client import EShopAPIClient, RateLimitExceeded
-from .rate_limiter import wait_for_rate_limit
 
 logger = logging.getLogger(__name__)
 
-_api_client = None
+class EShopSyncTask(Task):
+    _api_client = None
 
-@worker_process_init.connect
-def init_worker_session(**kwargs):
-    global _api_client
-    _api_client = EShopAPIClient()
+    @property
+    def api_client(self):
+        if self._api_client is None:
+            self._api_client = EShopAPIClient()
+        return self._api_client
 
 def _calculate_hash(payload: dict) -> str:
     json_str = json.dumps(payload, sort_keys=True).encode('utf-8')
@@ -51,37 +53,47 @@ def _dispatch_delta_tasks(chunk: dict) -> int:
         ProductSyncState.objects.filter(sku__in=skus).values_list('sku', 'data_hash')
     )
     
-    dispatched = 0
+    tasks_to_run = []
     for sku, (payload, prod_hash) in chunk.items():
         if sku in existing_states and existing_states[sku] == prod_hash:
             continue 
             
         is_new = sku not in existing_states
-        sync_single_product.delay(payload, prod_hash, is_new)
-        dispatched += 1
+        tasks_to_run.append(sync_single_product.s(payload, prod_hash, is_new))
         
-    return dispatched
+    if tasks_to_run:
+        chord(tasks_to_run)(bulk_save_sync_states.s())
+        
+    return len(tasks_to_run)
 
-@shared_task(bind=True, max_retries=10)
+@shared_task(bind=True, base=EShopSyncTask, max_retries=10, rate_limit='5/s')
 def sync_single_product(self, payload: dict, prod_hash: str, is_new: bool):
     sku = payload['sku']
-    
-    wait_for_rate_limit(limit_per_second=5)
-    
+
     try:
-        _api_client.sync_product(sku, payload, is_new, prod_hash)
-        
-        ProductSyncState.objects.update_or_create(
-            sku=sku,
-            defaults={'data_hash': prod_hash}
-        )
-        logger.info(f"Successfully synced SKU: {sku}")
+        self.api_client.sync_product(sku, payload, is_new, prod_hash)
+        return {'sku': sku, 'hash': prod_hash}
         
     except RateLimitExceeded as exc:
         logger.warning(f"Rate limit hit for {sku}. Retrying in {exc.retry_after}s.")
         raise self.retry(countdown=exc.retry_after, exc=exc)
+
+@shared_task
+def bulk_save_sync_states(results):
+    from .models import ProductSyncState
+    
+    successful_results = [r for r in results if isinstance(r, dict) and 'sku' in r]
+    if not successful_results:
+        return
         
-    except RequestException as exc:
-        backoff = (2 ** self.request.retries) + random.uniform(0, 1)
-        logger.error(f"API Error for {sku}. Retrying in {backoff:.2f}s. Error: {str(exc)}")
-        raise self.retry(countdown=backoff, exc=exc)
+    states_to_update = []
+    for res in successful_results:
+        state = ProductSyncState(sku=res['sku'], data_hash=res['hash'])
+        states_to_update.append(state)
+        
+    ProductSyncState.objects.bulk_create(
+        states_to_update,
+        update_conflicts=True,
+        unique_fields=['sku'],
+        update_fields=['data_hash', 'last_synced']
+    )
