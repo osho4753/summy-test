@@ -7,3 +7,6 @@ pytest
 pytest-django
 responses
 environs
+pydantic>=2.5.0
+ijson>=3.2.3
+redis>=5.0.0

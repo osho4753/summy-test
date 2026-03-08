@@ -2,319 +2,158 @@ import json
 import tempfile
 from decimal import Decimal
 from pathlib import Path
-from unittest.mock import patch, MagicMock
+from unittest.mock import patch
 
 import pytest
 import responses
 
 from integrator.models import ProductSyncState
-from integrator.services import (
-    parse_and_transform_erp_data,
-    _calculate_price_with_vat,
-    _calculate_stock_total,
-    _extract_color,
-)
-from integrator.tasks import (
-    sync_erp_to_eshop,
-    sync_product_to_eshop,
-    ESHOP_API_BASE_URL,
-    _calculate_hash,
-)
-
-class TestCalculatePriceWithVat:
-    """Tests for VAT calculation (21%)."""
-    
-    def test_valid_price_adds_21_percent_vat(self):
-        assert _calculate_price_with_vat(100.0) == Decimal('121.00')
-        assert _calculate_price_with_vat(12400.5) == Decimal('15004.61')
-    
-    def test_null_price_returns_zero(self):
-        """Null price results in Decimal('0.00')."""
-        assert _calculate_price_with_vat(None) == Decimal('0.00')
-    
-    def test_negative_price_returns_zero(self):
-        """Negative price (like -150.0 from SKU-002) results in Decimal('0.00')."""
-        assert _calculate_price_with_vat(-150.0) == Decimal('0.00')
-    
-    def test_zero_price_returns_zero(self):
-        """Zero price stays zero."""
-        assert _calculate_price_with_vat(0) == Decimal('0.00')
-
-
-class TestCalculateStockTotal:
-    """Tests for stock summation."""
-    
-    def test_valid_stocks_are_summed(self):
-        """Valid numeric stocks are correctly summed."""
-        stocks = {"praha": 5, "brno": 3}
-        assert _calculate_stock_total(stocks) == 8
-    
-    def test_string_na_treated_as_zero(self):
-        """String 'N/A' (like in SKU-008) is treated as 0."""
-        stocks = {"praha": "N/A"}
-        assert _calculate_stock_total(stocks) == 0
-    
-    def test_mixed_valid_and_invalid_stocks(self):
-        """Mix of valid and invalid values - only valid are summed."""
-        stocks = {"praha": 10, "brno": "N/A", "externi": 5}
-        assert _calculate_stock_total(stocks) == 15
-    
-    def test_null_stocks_returns_zero(self):
-        """Null stocks dict returns 0."""
-        assert _calculate_stock_total(None) == 0
-    
-    def test_empty_stocks_returns_zero(self):
-        """Empty stocks dict returns 0."""
-        assert _calculate_stock_total({}) == 0
-
-
-class TestExtractColor:
-    """Tests for color extraction from attributes."""
-    
-    def test_valid_color_extracted(self):
-        """Color is correctly extracted from attributes."""
-        attributes = {"color": "stříbrná"}
-        assert _extract_color(attributes) == "stříbrná"
-    
-    def test_null_attributes_returns_na(self):
-        """Null attributes (like SKU-003) returns 'N/A'."""
-        assert _extract_color(None) == "N/A"
-    
-    def test_empty_attributes_returns_na(self):
-        """Empty attributes dict returns 'N/A'."""
-        assert _extract_color({}) == "N/A"
-    
-    def test_missing_color_key_returns_na(self):
-        """Attributes without 'color' key returns 'N/A'."""
-        attributes = {"size": "large"}
-        assert _extract_color(attributes) == "N/A"
-
-
-@pytest.mark.django_db
-class TestParseAndTransformErpData:
-    """Integration tests for full transformation pipeline."""
-    
-    def test_full_transformation_with_temp_file(self, settings):
-        """Test complete transformation with temporary JSON file."""
-        # Create test data with known edge cases
-        test_data = [
-            {
-                "id": "TEST-001",
-                "title": "Test Product",
-                "price_vat_excl": 100.0,
-                "stocks": {"warehouse1": 10, "warehouse2": 5},
-                "attributes": {"color": "red"}
-            },
-            {
-                "id": "TEST-002",
-                "title": "Negative Price",
-                "price_vat_excl": -50.0,
-                "stocks": {"warehouse1": 3},
-                "attributes": None
-            },
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    result = parse_and_transform_erp_data()
-            
-            assert len(result) == 2
-            
-            # Check first product
-            product1 = next(p for p in result if p['sku'] == 'TEST-001')
-            assert product1['price_vat_incl'] == Decimal('121.00')  # 100 * 1.21
-            assert product1['stock_total'] == 15  # 10 + 5
-            assert product1['color'] == 'red'
-            
-            # Check second product (edge cases)
-            product2 = next(p for p in result if p['sku'] == 'TEST-002')
-            assert product2['price_vat_incl'] == Decimal('0.00')  # Negative → 0
-            assert product2['color'] == 'N/A'  # None attributes
-    
-    def test_deduplication_keeps_last_occurrence(self, settings):
-        """Duplicate SKUs are deduplicated (last occurrence wins)."""
-        test_data = [
-            {"id": "DUP-001", "title": "First", "price_vat_excl": 100, "stocks": {}, "attributes": {}},
-            {"id": "DUP-001", "title": "Second", "price_vat_excl": 200, "stocks": {}, "attributes": {}},
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    result = parse_and_transform_erp_data()
-            
-            # Only one product should exist
-            assert len(result) == 1
-            # Last occurrence should be kept
-            assert result[0]['title'] == 'Second'
-            assert result[0]['price_vat_incl'] == Decimal('242.00')  # 200 * 1.21
-
+from integrator.schemas import ProductSchema
+from integrator.services import stream_erp_data_in_batches
+from integrator.tasks import sync_erp_to_eshop, process_sync_batch, init_worker_session
 
 # =============================================================================
-# BLOCK B: Integration tests for Celery task
+# 1: Validation tests (Pydantic)
 # =============================================================================
 
-@pytest.mark.django_db
-class TestSyncErpToEshopTask:
-    """Tests for sync_erp_to_eshop orchestrator task."""
-    
-    def test_orchestrator_dispatches_new_products(self, settings):
-        """Orchestrator dispatches sub-tasks for new products."""
-        test_data = [
-            {
-                "id": "NEW-001",
-                "title": "New Product",
-                "price_vat_excl": 100.0,
-                "stocks": {"warehouse": 10},
-                "attributes": {"color": "blue"}
-            }
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    with patch('integrator.tasks.group') as mock_group:
-                        mock_group.return_value.apply_async = MagicMock()
-                        result = sync_erp_to_eshop()
-            
-            assert result['dispatched'] == 1
-            assert result['skipped'] == 0
-            assert result['total'] == 1
-    
-    def test_unchanged_product_is_skipped(self, settings):
-        """Products with unchanged hash are skipped by orchestrator."""
-        test_data = [
-            {
-                "id": "SKIP-001",
-                "title": "Already Synced",
-                "price_vat_excl": 100.0,
-                "stocks": {"warehouse": 5},
-                "attributes": {"color": "green"}
-            }
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir_path = Path(tmpdirname)
-            temp_path = tmp_dir_path / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir_path):
-                with patch('integrator.services.settings', settings):
-                    # Pre-create sync state with matching hash
-                    products = parse_and_transform_erp_data()
-                    product_hash = _calculate_hash(products[0])
-                    ProductSyncState.objects.create(sku='SKIP-001', data_hash=product_hash)
-                    
-                    with patch('integrator.tasks.group') as mock_group:
-                        result = sync_erp_to_eshop()
-            
-            assert result['skipped'] == 1
-            assert result['dispatched'] == 0
-            mock_group.assert_not_called()
+class TestProductSchemaValidation:
 
-
-@pytest.mark.django_db
-class TestSyncProductToEshopTask:
-    """Tests for sync_product_to_eshop sub-task."""
-    
-    @responses.activate
-    def test_successful_post_creates_sync_state(self):
-        """Successful POST creates ProductSyncState record."""
-        product = {
-            'sku': 'NEW-001',
-            'title': 'New Product',
-            'price_vat_incl': 121.0,
-            'stock_total': 10,
-            'color': 'blue'
+    def test_valid_product_transformation(self):
+        raw_data = {
+            "id": "SKU-001",
+            "title": "Kávovar",
+            "price_vat_excl": 100.0,
+            "stocks": {"praha": 5, "brno": 3},
+            "attributes": {"color": "stříbrná"}
         }
-        product_hash = _calculate_hash(product)
+        product = ProductSchema(**raw_data)
+        
+        assert product.sku == "SKU-001"
+        assert product.price_vat_incl == Decimal('121.00')  # 100 * 1.21
+        assert product.stock_total == 8                     # 5 + 3
+        assert product.color == "stříbrná"
+
+    def test_edge_cases_and_nulls(self):
+        raw_data = {
+            "id": "SKU-002",
+            "title": "Chyba",
+            "price_vat_excl": -150.0,       
+            "stocks": {"praha": "N/A"},     
+            "attributes": None             
+        }
+        product = ProductSchema(**raw_data)
+        
+        assert product.price_vat_incl == Decimal('0.00')
+        assert product.stock_total == 0
+        assert product.color == "N/A"
+
+
+# =============================================================================
+# 2: batches generator tests
+# =============================================================================
+
+@pytest.mark.django_db
+class TestStreamErpData:
+    def test_stream_erp_data_in_batches(self, settings):
+        test_data = [
+            {"id": "TEST-001", "title": "First", "price_vat_excl": 100},
+            {"id": "TEST-002", "title": "Second", "price_vat_excl": 200},
+            {"id": "TEST-003", "title": "Third", "price_vat_excl": 300},
+        ]
+        
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            tmp_dir = Path(tmpdirname)
+            temp_path = tmp_dir / 'erp_data.json'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(test_data, f)
+            
+            with patch.object(settings, 'BASE_DIR', tmp_dir):
+                batches = list(stream_erp_data_in_batches(batch_size=2))
+        
+        assert len(batches) == 2
+        assert len(batches[0]) == 2
+        assert len(batches[1]) == 1
+        assert batches[0][0]['sku'] == 'TEST-001'
+        assert batches[1][0]['sku'] == 'TEST-003'
+
+    def test_deduplication_keeps_last_occurrence(self, settings):
+        test_data = [
+            {"id": "DUP-001", "title": "Old", "price_vat_excl": 100},
+            {"id": "DUP-001", "title": "New", "price_vat_excl": 200},
+        ]
+        
+        with tempfile.TemporaryDirectory() as tmpdirname:
+            tmp_dir = Path(tmpdirname)
+            temp_path = tmp_dir / 'erp_data.json'
+            with open(temp_path, 'w', encoding='utf-8') as f:
+                json.dump(test_data, f)
+            
+            with patch.object(settings, 'BASE_DIR', tmp_dir):
+                batches = list(stream_erp_data_in_batches(batch_size=5))
+        
+        assert len(batches) == 1
+        assert len(batches[0]) == 1
+        assert batches[0][0]['title'] == 'New'
+        assert batches[0][0]['price_vat_incl'] == '242.00'
+
+
+# =============================================================================
+# 3: Celery tasks tests
+# =============================================================================
+
+@pytest.mark.django_db
+class TestCeleryTasks:
+    def setup_method(self):
+        init_worker_session()
+
+    @patch('integrator.tasks.process_sync_batch.delay')
+    @patch('integrator.tasks.stream_erp_data_in_batches')
+    def test_sync_erp_to_eshop_orchestrator(self, mock_stream, mock_delay):
+        mock_stream.return_value = [[{"sku": "1"}], [{"sku": "2"}], [{"sku": "3"}]]
+        
+        result = sync_erp_to_eshop()
+        
+        assert result['dispatched_batches'] == 3
+        assert mock_delay.call_count == 3
+
+    @responses.activate
+    def test_process_sync_batch_success(self, settings):
+        batch = [
+            {'sku': 'NEW-001', 'title': 'P1', 'price_vat_incl': '121.00', 'stock_total': 10, 'color': 'red'},
+            {'sku': 'NEW-002', 'title': 'P2', 'price_vat_incl': '242.00', 'stock_total': 5, 'color': 'blue'}
+        ]
         
         responses.add(
             responses.POST,
-            f"{ESHOP_API_BASE_URL}/",
+            f"{settings.ESHOP_API_BASE_URL}/",
             json={"status": "created"},
             status=201
         )
         
-        result = sync_product_to_eshop(product, product_hash, is_new=True)
+        process_sync_batch(batch)
         
-        assert result['status'] == 'created'
+        assert ProductSyncState.objects.count() == 2
         assert ProductSyncState.objects.filter(sku='NEW-001').exists()
-        sync_state = ProductSyncState.objects.get(sku='NEW-001')
-        assert sync_state.data_hash == product_hash
-    
+        assert ProductSyncState.objects.filter(sku='NEW-002').exists()
+
     @responses.activate
-    def test_successful_patch_updates_sync_state(self):
-        """Successful PATCH updates existing ProductSyncState."""
-        product = {
-            'sku': 'MOD-001',
-            'title': 'Modified Product',
-            'price_vat_incl': 150.0,
-            'stock_total': 5,
-            'color': 'red'
-        }
-        old_hash = 'old_hash_value'
-        new_hash = _calculate_hash(product)
-        
-        ProductSyncState.objects.create(sku='MOD-001', data_hash=old_hash)
-        
-        responses.add(
-            responses.PATCH,
-            f"{ESHOP_API_BASE_URL}/MOD-001/",
-            json={"status": "updated"},
-            status=200
-        )
-        
-        result = sync_product_to_eshop(product, new_hash, is_new=False)
-        
-        assert result['status'] == 'updated'
-        sync_state = ProductSyncState.objects.get(sku='MOD-001')
-        assert sync_state.data_hash == new_hash
-    
-    @responses.activate
-    def test_rate_limit_429_triggers_retry(self):
-        """429 response triggers task retry."""
-        product = {
-            'sku': 'RATE-001',
-            'title': 'Rate Limited Product',
-            'price_vat_incl': 50.0,
-            'stock_total': 0,
-            'color': 'N/A'
-        }
-        product_hash = _calculate_hash(product)
+    def test_process_sync_batch_rate_limit_retry(self, settings):
+        batch = [
+            {'sku': 'RATE-001', 'title': 'Test', 'price_vat_incl': '50.00', 'stock_total': 0, 'color': 'N/A'}
+        ]
         
         responses.add(
             responses.POST,
-            f"{ESHOP_API_BASE_URL}/",
+            f"{settings.ESHOP_API_BASE_URL}/",
             json={"error": "rate limit exceeded"},
-            status=429
+            status=429,
+            headers={"Retry-After": "15"}
         )
         
-        with patch.object(sync_product_to_eshop, 'retry', side_effect=Exception("Retry triggered")) as mock_retry:
-            with pytest.raises(Exception, match="Retry triggered"):
-                sync_product_to_eshop(product, product_hash, is_new=True)
+        with patch.object(process_sync_batch, 'retry', side_effect=Exception("Retry Triggered")) as mock_retry:
+            with pytest.raises(Exception, match="Retry Triggered"):
+                process_sync_batch(batch)
             
             mock_retry.assert_called_once()
             call_kwargs = mock_retry.call_args[1]
-            assert call_kwargs['countdown'] == 10
-
-
-
-
+            assert call_kwargs['countdown'] == 15
