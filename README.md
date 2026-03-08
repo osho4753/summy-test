@@ -1,24 +1,28 @@
-# Symmy Task — ERP to E-shop Integration
+# Symmy Task — Highload ERP to E-shop Integration
 
-Django application for synchronizing ERP data to e-shop via Celery.
+A robust, production-ready Django application for synchronizing large-scale ERP data to an e-shop via Celery. Designed with high-load principles, memory efficiency, and strict data validation in mind.
 
-## Features
+## 🚀 Key Architectural Features
 
-- **Delta Sync** — sends only changed data (based on SHA-256 hash)
-- **Data Transformation** — automatic VAT calculation (21%), stock aggregation
-- **Edge Case Handling** — null values, duplicates, invalid data
-- **Rate Limiting** — automatic retry on 429 response
+- **Memory-Efficient Processing (Stream Parsing)** — Uses `ijson` to read massive JSON files in chunks. Eliminates Out-Of-Memory (OOM) risks regardless of the ERP dump size.
+- **Strict Data Validation** — Powered by `Pydantic`. Ensures bulletproof type coercion, handles edge cases (e.g., negative prices, missing attributes), and encapsulates business logic.
+- **Optimized Database I/O** — Drastically reduces database load by using batched `bulk_create` with conflict resolution (`update_conflicts=True`) instead of thousands of isolated transactions.
+- **Smart Rate Limiting** — Advanced 429 Error handling. Respects external API limits by dynamically reading `Retry-After` headers and utilizing **Exponential Backoff with Jitter** to prevent "Thundering Herd" DDoS scenarios.
+- **Delta Sync** — Sends only changed data based on SHA-256 hashing to minimize network overhead.
+- **Safe Prefork Networking** — HTTP Sessions are securely initialized per-worker-process via Celery signals to prevent socket corruption.
 
-## Tech Stack
+## 🛠 Tech Stack
 
 - Python 3.11+
 - Django 5.2
 - Celery + Redis
 - PostgreSQL
+- **Pydantic** (Validation & Transformation)
+- **ijson** (Stream Parsing)
 - Docker & Docker Compose
-- pytest
+- pytest & responses
 
-## Quick Start
+## 🚦 Quick Start
 
 ### 1. Clone and Run
 
@@ -27,100 +31,83 @@ git clone <repo-url>
 cd symmy-task
 docker-compose up -d --build
 ```
+````
 
 ### 2. Apply Migrations
 
 ```bash
 docker-compose exec web python manage.py migrate
+
 ```
 
-### 3. Start Celery Worker
+### 3. Run Sync Task
+
+The background worker starts automatically via Docker Compose. Trigger the orchestrator task from the Django shell:
 
 ```bash
-docker-compose exec web celery -A core worker --loglevel=info
-```
-
-### 4. Run Sync Task
-
-```python
-# Django shell
 docker-compose exec web python manage.py shell
 
 >>> from integrator.tasks import sync_erp_to_eshop
->>> sync_erp_to_eshop.delay()  # Async
-# or
->>> sync_erp_to_eshop()  # Sync
-```
-
-## Project Structure
+>>> sync_erp_to_eshop.delay()
 
 ```
+
+## 📁 Project Structure
+
+```text
 symmy-task/
-├── core/                    # Django project
-│   ├── celery.py            # Celery configuration
-│   ├── settings.py          # Django settings
-│   └── ...
+├── core/                    # Django project configuration
 ├── integrator/              # Integration app
 │   ├── models.py            # ProductSyncState (Delta Sync)
-│   ├── services.py          # Transformation business logic
-│   ├── tasks.py             # Celery task sync_erp_to_eshop
-│   ├── tests.py             # Tests (pytest + responses)
+│   ├── schemas.py           # Pydantic schemas (Validation & Transformation)
+│   ├── services.py          # Stream parsing logic (ijson chunks)
+│   ├── tasks.py             # Celery tasks (Orchestrator & Batch Processing)
+│   ├── tests.py             # Pytest suite with mock responses
 │   └── admin.py             # Admin panel
 ├── erp_data.json            # ERP test data
 ├── docker-compose.yml
 ├── Dockerfile
 ├── requirements.txt
 └── pytest.ini
+
 ```
 
-## ERP Data (erp_data.json)
+## 🔄 Transformation Logic (Pydantic Schema)
 
-File contains test data with edge cases:
+- **Price:** `price_vat_incl = round(price_vat_excl * 1.21, 2)`. Null, missing, or negative values automatically default to `0.00`.
+- **Stock:** `stock_total = sum(valid_numeric_stocks)`. Invalid values (e.g., `"N/A"`, booleans) are safely ignored.
+- **Color:** Safely extracted from nested `attributes`. Defaults to `"N/A"` if missing.
 
-| SKU     | Edge Case                      |
-| ------- | ------------------------------ |
-| SKU-001 | Valid reference record         |
-| SKU-002 | Negative price → 0             |
-| SKU-003 | `attributes: null` → color N/A |
-| SKU-004 | `price_vat_excl: null` → 0     |
-| SKU-006 | Duplicate (deduplication)      |
-| SKU-008 | `stocks.praha: "N/A"` → 0      |
-
-## Transformation Logic
-
-- **Price:** `price_vat_incl = round(price_vat_excl * 1.21, 2)` (null/negative → 0)
-- **Stock:** `stock_total = sum(stocks.values())` (invalid values → 0)
-- **Color:** `color = attributes.color` or `"N/A"`
-
-## E-shop API
+## 🌐 E-shop API Configuration
 
 | Scenario       | Method | URL                                            |
 | -------------- | ------ | ---------------------------------------------- |
 | New product    | POST   | `https://api.fake-eshop.cz/v1/products/`       |
 | Update product | PATCH  | `https://api.fake-eshop.cz/v1/products/{sku}/` |
 
-Headers: `{"X-Api-Key": "symma-secret-token"}`
+Authentication: `{"X-Api-Key": "symma-secret-token"}`
 
-## Testing
+## 🧪 Testing
+
+The project includes a robust testing suite focusing on schema validation, chunking, and Celery retries.
 
 ```bash
+# Run tests with verbosity
 docker-compose exec web pytest integrator/tests.py -v
+
 ```
 
-### Test Coverage
+**Test Coverage Highlights:**
 
-- Unit tests for transformation (VAT, stocks, color)
-- Integration tests for Celery task
-- API mocking via `responses`
-- Rate limiting test (429 → retry)
+- `Pydantic` schema transformation and edge-case handling.
+- Batched stream parsing deduplication.
+- API mocking via `responses` for successful POST/PATCH batch syncs.
+- Retry mechanisms and Rate Limit handling verification.
 
-## Environment Variables
+## 🔧 Environment Variables
 
-| Variable                 | Default Value          |
-| ------------------------ | ---------------------- |
-| `CELERY_BROKER_URL`      | `redis://redis:6379/0` |
-| `DJANGO_SETTINGS_MODULE` | `core.settings`        |
-
-## License
-
-MIT
+| Variable             | Default Value                           |
+| -------------------- | --------------------------------------- |
+| `CELERY_BROKER_URL`  | `redis://redis:6379/0`                  |
+| `ESHOP_API_BASE_URL` | `https://api.fake-eshop.cz/v1/products` |
+| `ESHOP_API_KEY`      | _Empty string_                          |
