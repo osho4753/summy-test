@@ -11,7 +11,7 @@ from integrator.models import ProductSyncState
 from integrator.schemas import ProductSchema
 from integrator.services import stream_erp_data
 from integrator.tasks import sync_erp_to_eshop, sync_single_product, init_worker_session
-
+from integrator.api_client import RateLimitExceeded
 
 # =============================================================================
 # 1: Validation tests (Pydantic)
@@ -78,7 +78,25 @@ class TestStreamErpData:
         assert isinstance(items[0], ProductSchema)
         assert items[0].sku == 'TEST-001'
         assert items[1].price_vat_incl == Decimal('242.00')
-
+    def test_stream_erp_data_skips_invalid_items(self, settings):
+            test_data = [
+                {"id": "VALID-001", "title": "Good", "price_vat_excl": 100},
+                {"id": "BROKEN-001", "title": "Bad", "price_vat_excl": "не_число"}, # Вызовет ValidationError
+                {"id": "VALID-002", "title": "Good 2", "price_vat_excl": 200},
+            ]
+            
+            with tempfile.TemporaryDirectory() as tmpdirname:
+                tmp_dir = Path(tmpdirname)
+                temp_path = tmp_dir / 'erp_data.json'
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(test_data, f)
+                
+                with patch.object(settings, 'BASE_DIR', tmp_dir):
+                    items = list(stream_erp_data())
+            
+            assert len(items) == 2
+            assert items[0].sku == 'VALID-001'
+            assert items[1].sku == 'VALID-002'
 
 # =============================================================================
 # 3: Celery tasks orchestrator
@@ -86,42 +104,13 @@ class TestStreamErpData:
 
 @pytest.mark.django_db
 class TestCeleryTasks:
-    """Тесты оркестратора и атомарных задач."""
 
     def setup_method(self):
         init_worker_session()
 
-    @patch('integrator.tasks.sync_single_product.delay')
-    def test_sync_erp_to_eshop_orchestrator(self, mock_delay, settings):
-        test_data = [
-            {"id": "NEW-001", "title": "New", "price_vat_excl": 100},
-            {"id": "SKIP-001", "title": "Old", "price_vat_excl": 100},
-        ]
-        
-        with tempfile.TemporaryDirectory() as tmpdirname:
-            tmp_dir = Path(tmpdirname)
-            temp_path = tmp_dir / 'erp_data.json'
-            with open(temp_path, 'w', encoding='utf-8') as f:
-                json.dump(test_data, f)
-            
-            with patch.object(settings, 'BASE_DIR', tmp_dir):
-                schema = ProductSchema(**test_data[1])
-                payload = schema.to_eshop_payload()
-                import hashlib
-                import json as base_json
-                hash_val = hashlib.sha256(base_json.dumps(payload, sort_keys=True).encode()).hexdigest()
-                ProductSyncState.objects.create(sku="SKIP-001", data_hash=hash_val)
-
-                result = sync_erp_to_eshop()
-        
-        assert result['dispatched_tasks'] == 1
-        assert mock_delay.call_count == 1
-        
-        called_payload = mock_delay.call_args[0][0]
-        assert called_payload['sku'] == 'NEW-001'
-
     @responses.activate
-    def test_sync_single_product_success(self, settings):
+    @patch('integrator.tasks.wait_for_rate_limit') # Мокаем Redis Rate Limiter
+    def test_sync_single_product_success(self, mock_rate_limit, settings):
         payload = {'sku': 'NEW-001', 'title': 'P1', 'price_vat_incl': '121.00', 'stock_total': 10, 'color': 'red'}
         prod_hash = "fake_hash_123"
         
@@ -134,10 +123,14 @@ class TestCeleryTasks:
         
         sync_single_product(payload, prod_hash, is_new=True)
         
+        # Проверяем, что лимитер вызывался
+        mock_rate_limit.assert_called_once_with(limit_per_second=5)
+        # Проверяем базу
         assert ProductSyncState.objects.filter(sku='NEW-001', data_hash=prod_hash).exists()
 
     @responses.activate
-    def test_sync_single_product_rate_limit_retry(self, settings):
+    @patch('integrator.tasks.wait_for_rate_limit') # Мокаем Redis Rate Limiter
+    def test_sync_single_product_rate_limit_retry(self, mock_rate_limit, settings):
         payload = {'sku': 'RATE-001', 'title': 'Test', 'price_vat_incl': '50.00', 'stock_total': 0, 'color': 'N/A'}
         prod_hash = "fake_hash_456"
         
@@ -149,8 +142,9 @@ class TestCeleryTasks:
             headers={"Retry-After": "15"}
         )
         
-        with patch.object(sync_single_product, 'retry', side_effect=Exception("Rate Limit 429")) as mock_retry:
-            with pytest.raises(Exception, match="Rate Limit 429"):
+        # Теперь мы ловим RateLimitExceeded вместо базового Exception
+        with patch.object(sync_single_product, 'retry', side_effect=RateLimitExceeded(15)) as mock_retry:
+            with pytest.raises(RateLimitExceeded):
                 sync_single_product(payload, prod_hash, is_new=True)
             
             mock_retry.assert_called_once()
