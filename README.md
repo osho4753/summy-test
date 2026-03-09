@@ -1,10 +1,10 @@
-# Symmy Task — Highload ERP to E-shop Integration
+# Symmy Task
 
-A robust, production-ready Django application for synchronizing large-scale ERP data to an e-shop via Celery. Designed with high-load principles, memory efficiency, and strict network/database optimization in mind.
+A robust Django application for synchronizing large-scale ERP data to an e-shop via Celery.
 
-## 🚀 Key Architectural Features
+## Key Architectural Features
 
-- **Non-blocking Rate Limiting** — API rate limits (5 req/s) and `429 Too Many Requests` are handled natively via Celery's `rate_limit` and non-blocking `self.retry()`. No threads or workers are ever put to sleep (`time.sleep`), ensuring maximum throughput and preventing worker starvation.
+- **Non-blocking Rate Limiting** — API rate limits (5 req/s) and `429 Too Many Requests` are handled natively via Celery's `rate_limit` and non-blocking `self.retry()`.
 - **Zero N+1 Database Writes (Celery Chords)** — Writing synchronization states to the database one by one would crush the DB under high load. This system uses `celery.chord` to dispatch a batch of atomic HTTP tasks, gather their successful results, and write them to PostgreSQL in a single `bulk_create`/`bulk_update` query.
 - **Smart API Fallback (POST -> PATCH)** — Local database state is treated as a cache, not the absolute source of truth. If a `POST` request fails with a `409 Conflict` (or `400` duplicate error), the API Client automatically falls back to a `PATCH` request, making the synchronization highly resilient to state mismatches.
 - **Class-Based Task Connection Pooling** — HTTP Sessions are preserved across task executions to reduce socket overhead. Instead of using anti-patterns like global variables and signal hooks, this is cleanly achieved using Custom Class-Based Celery Tasks (`celery.Task` inheritance).
@@ -22,7 +22,7 @@ A robust, production-ready Django application for synchronizing large-scale ERP 
 - Docker & Docker Compose
 - pytest & responses
 
-## 🚦 Quick Start
+## Quick Start
 
 ### 1. Clone and Run
 
@@ -53,7 +53,7 @@ docker-compose exec web python manage.py shell
 
 ```
 
-## 📁 Project Structure
+## Project Structure
 
 ```text
 symmy-task/
@@ -73,13 +73,13 @@ symmy-task/
 
 ```
 
-## 🔄 Transformation Logic
+## Transformation Logic
 
 - **Price:** `price_vat_incl = price_vat_excl * VAT_MULTIPLIER`. Null, missing, or negative values automatically default to `0.00`. The VAT multiplier is configurable via `.env`.
 - **Stock:** `stock_total = sum(valid_numeric_stocks)`. Invalid values (e.g., `"N/A"`, booleans) are safely ignored.
 - **Color:** Safely extracted from nested `attributes`. Defaults to `"N/A"` if missing.
 
-## 🌐 E-shop API Configuration
+## E-shop API Configuration
 
 | Scenario       | Method | URL                                            |
 | -------------- | ------ | ---------------------------------------------- |
@@ -88,7 +88,7 @@ symmy-task/
 
 Authentication: `{"X-Api-Key": "symma-secret-token"}`
 
-## 🧪 Testing
+## Testing
 
 The project includes a robust testing suite focusing on schema validation, high-load architecture (bulk database writes), and API resilience (Fallback & Rate Limiting).
 
@@ -98,7 +98,7 @@ docker-compose exec web pytest integrator/tests.py -v
 
 ```
 
-## 🔧 Environment Variables
+## Environment Variables
 
 | Variable             | Default Value                           | Description                           |
 | -------------------- | --------------------------------------- | ------------------------------------- |
